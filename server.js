@@ -16,7 +16,6 @@ if (!process.env.DEEPGRAM_API_KEY || !process.env.GEMINI_API_KEY) {
 
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-// Using 1.5-flash for maximum speed on turn-taking decisions
 const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
 function log(label, message) {
