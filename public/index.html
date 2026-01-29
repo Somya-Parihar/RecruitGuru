@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Voice AI (Patient)</title>
+    <title>Voice AI (Patient) - Smooth Playback</title>
     <style>
         body { 
             font-family: 'Segoe UI', sans-serif; 
@@ -36,7 +36,6 @@
 </head>
 <body>
     <div id="chat-box"></div>
-
     <div id="controls">
         <div id="mic-indicator" class="indicator"></div>
         <button id="recordBtn">Start Conversation</button>
@@ -52,14 +51,12 @@
         let nextStartTime = 0;
         let sourceNodes = [];
         let scriptProcessor;
-        
-        // --- CONFIG ---
         let aiIsSpeaking = false;
-        
-        // SENSITIVE GATE + STICKY MIC
-        const NOISE_GATE = 0.01;     
+
+        // --- CONFIG ---
+        const NOISE_GATE = 0.05;     
         let silenceFrames = 0;
-        const SILENCE_FRAME_THRESHOLD = 100; // ~2.5s hangover
+        const SILENCE_FRAME_THRESHOLD = 80; 
 
         let currentInterimMsg = null; 
         let currentUserMsg = null;
@@ -67,18 +64,15 @@
 
         recordBtn.addEventListener('click', async () => {
             if (audioContext && audioContext.state === 'running') {
-                audioContext.close();
-                if (socket) socket.close();
-                recordBtn.innerText = "Start Conversation";
-                recordBtn.classList.remove('active');
-                micIndicator.classList.remove('on');
+                stopSession();
                 return;
             }
 
             audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
             socket = new WebSocket(`ws://${window.location.host}`);
             
-            socket.onopen = async () => {
+            socket.onopen = () => {
+                console.log("[Socket] Connected");
                 recordBtn.innerText = "Stop Conversation";
                 recordBtn.classList.add('active');
                 startMicrophone();
@@ -86,23 +80,29 @@
 
             socket.onmessage = async (event) => {
                 const msg = JSON.parse(event.data);
-
                 if (msg.type === 'audio') {
                     playAudioChunk(msg.data);
-                } 
-                else if (msg.type === 'transcript') {
+                } else if (msg.type === 'transcript') {
                     handleTranscript(msg);
-                }
-                else if (msg.type === 'response_complete') {
+                } else if (msg.type === 'response_complete') {
                     currentAiMsg = null; 
                 }
             };
+
+            socket.onclose = () => stopSession();
         });
+
+        function stopSession() {
+            if (audioContext) audioContext.close();
+            if (socket) socket.close();
+            recordBtn.innerText = "Start Conversation";
+            recordBtn.classList.remove('active');
+            micIndicator.className = "indicator";
+        }
 
         function handleTranscript(msg) {
             if (msg.sender === "user") {
                 if (aiIsSpeaking) stopAllAudio(); 
-
                 currentAiMsg = null;
                 if (currentInterimMsg) { currentInterimMsg.remove(); currentInterimMsg = null; }
 
@@ -121,8 +121,7 @@
                     currentInterimMsg.innerText = msg.text + "...";
                     chatBox.appendChild(currentInterimMsg);
                 }
-            } 
-            else if (msg.sender === "ai") {
+            } else if (msg.sender === "ai") {
                 currentUserMsg = null; 
                 if (!currentAiMsg) {
                     currentAiMsg = document.createElement('div');
@@ -139,50 +138,41 @@
                 const stream = await navigator.mediaDevices.getUserMedia({
                     audio: { sampleRate: 16000, echoCancellation: true, noiseSuppression: true }
                 });
-                
                 const mic = audioContext.createMediaStreamSource(stream);
                 scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
-                
                 mic.connect(scriptProcessor);
                 scriptProcessor.connect(audioContext.destination);
 
                 scriptProcessor.onaudioprocess = (e) => {
+                    if (!socket || socket.readyState !== WebSocket.OPEN) return;
                     const inputData = e.inputBuffer.getChannelData(0);
-                    
                     let sum = 0;
                     for(let i=0; i<inputData.length; i++) sum += inputData[i]*inputData[i];
                     const rms = Math.sqrt(sum/inputData.length);
                     
-                    if (socket.readyState === WebSocket.OPEN) {
-                        
-                        if (aiIsSpeaking && rms > NOISE_GATE) {
-                             stopAllAudio();
-                             socket.send(JSON.stringify({ type: "interrupt_signal" }));
-                             socket.send(convertFloat32ToInt16(inputData));
-                             currentAiMsg = null;
-                             return; 
-                        }
+                    // Adaptive Noise Gate: Ignore AI echo
+                    const activeGate = aiIsSpeaking ? NOISE_GATE * 2.2 : NOISE_GATE;
 
-                        if (rms > NOISE_GATE) {
-                            silenceFrames = 0; 
-                            micIndicator.classList.add('on');
+                    if (rms > activeGate) {
+                        if (aiIsSpeaking) {
+                            console.log("[Interrupt] Stopping AI playback");
+                            stopAllAudio();
+                            socket.send(JSON.stringify({ type: "interrupt_signal" }));
+                        }
+                        silenceFrames = 0; 
+                        micIndicator.classList.add('on');
+                        socket.send(convertFloat32ToInt16(inputData));
+                    } else {
+                        silenceFrames++;
+                        if (silenceFrames < SILENCE_FRAME_THRESHOLD) {
                             socket.send(convertFloat32ToInt16(inputData));
-                        } 
-                        else {
-                            silenceFrames++;
-                            if (silenceFrames < SILENCE_FRAME_THRESHOLD) {
-                                micIndicator.classList.add('on'); 
-                                socket.send(convertFloat32ToInt16(inputData));
-                            } else {
-                                micIndicator.classList.remove('on');
-                                socket.send(new Int16Array(inputData.length).fill(0).buffer);
-                            }
+                        } else {
+                            micIndicator.classList.remove('on');
+                            socket.send(new Int16Array(inputData.length).fill(0).buffer);
                         }
                     }
                 };
-            } catch(e) {
-                console.error("Mic Error", e);
-            }
+            } catch(e) { console.error("Mic Error", e); }
         }
 
         function convertFloat32ToInt16(float32) {
@@ -195,14 +185,12 @@
         }
 
         function playAudioChunk(base64) {
-            currentUserMsg = null;
             aiIsSpeaking = true;
             micIndicator.classList.add('speaking'); 
 
             const binary = atob(base64);
-            const len = binary.length;
-            const bytes = new Uint8Array(len);
-            for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
             
             const int16 = new Int16Array(bytes.buffer);
             const float32 = new Float32Array(int16.length);
@@ -215,7 +203,12 @@
             source.buffer = buffer;
             source.connect(audioContext.destination);
             
-            if (nextStartTime < audioContext.currentTime) nextStartTime = audioContext.currentTime;
+            const now = audioContext.currentTime;
+            
+            // JITTER BUFFER: 200ms look-ahead to handle network bursts
+            if (nextStartTime < now) {
+                nextStartTime = now + 0.2; 
+            }
             
             source.start(nextStartTime);
             nextStartTime += buffer.duration;
@@ -234,12 +227,7 @@
         async function stopAllAudio() {
             sourceNodes.forEach(node => { try { node.stop(); } catch(e) {} });
             sourceNodes = [];
-            
-            if (audioContext.state === 'running') {
-                await audioContext.suspend();
-                await audioContext.resume();
-            }
-            nextStartTime = audioContext.currentTime;
+            nextStartTime = 0;
             aiIsSpeaking = false;
             micIndicator.classList.remove('speaking');
         }
